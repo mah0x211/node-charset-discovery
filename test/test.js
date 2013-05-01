@@ -9,3 +9,6 @@ console.log(
     )
 );
 
+var cd = new charsetDiscovery();
+console.log( cd );
+console.log( cd.detect('abc') );
