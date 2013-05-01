@@ -25,6 +25,13 @@ using namespace node;
 #define Str2Err(v)          Exception::Error(String::New(v))
 #define Str2TypeErr(v)      Exception::TypeError(String::New(v))
 
+typedef struct {
+    Local<String> str;
+    size_t len;
+    UErrorCode status;
+    const UCharsetMatch *match;
+} Detect_t;
+
 // interface
 class CharsetDiscovery : public ObjectWrap 
 {
@@ -35,8 +42,12 @@ class CharsetDiscovery : public ObjectWrap
     
     private:
         UCharsetDetector *csd;
+        
+        Handle<Value> Prepare( Detect_t *d, const Arguments& argv );
+        UErrorCode Detect( Detect_t *d );
+        
         static Handle<Value> New( const Arguments& argv );
-        static Handle<Value> Detect( const Arguments& argv );
+        static Handle<Value> GetName( const Arguments& argv );
 };
 
 CharsetDiscovery::CharsetDiscovery()
@@ -71,45 +82,63 @@ Handle<Value> CharsetDiscovery::New( const Arguments& argv )
     return scope.Close( retval );
 }
 
+Handle<Value> CharsetDiscovery::Prepare( Detect_t *d, const Arguments& argv )
+{
+    int argc = argv.Length();
+    
+    if( !argc ){
+        return Str2Err( "undefined arguments" );
+    }
+    else if( !argv[0]->IsString() ){
+        return Str2TypeErr( "invalid type of arguments" );
+    }
+    
+    d->str = argv[0]->ToString();
+    d->len = d->str->Utf8Length();
+    
+    return Undefined();
+}
 
-Handle<Value> CharsetDiscovery::Detect( const Arguments& argv )
+UErrorCode CharsetDiscovery::Detect( Detect_t *d )
+{
+    d->status = U_ZERO_ERROR;
+    ucsdet_setText( csd, *String::Utf8Value( d->str ), d->len, &d->status );
+    if( !U_FAILURE( d->status ) ){
+        d->match = ucsdet_detect( csd, &d->status );
+        d->status = U_ZERO_ERROR;
+    }
+    
+    return d->status;
+}
+
+Handle<Value> CharsetDiscovery::GetName( const Arguments& argv )
 {
     HandleScope scope;
     CharsetDiscovery *cd = ObjUnwrap( CharsetDiscovery, argv.This() );
-    int argc = argv.Length();
-    UErrorCode status = U_ZERO_ERROR;
-    Local<String> str;
-    size_t len = 0;
-    const UCharsetMatch *match = NULL;
-    const char *enc = NULL;
+    Detect_t d;
+    Handle<Value> retval = cd->Prepare( &d, argv );
     
-    if( !argc ){
-        return scope.Close( Throw( Str2Err( "undefined arguments" ) ) );
+    if( !retval->IsUndefined() ){
+        return scope.Close( Throw( retval ) );
     }
-    else if( !argv[0]->IsString() ){
-        return scope.Close( Throw( Str2TypeErr( "invalid type of arguments" ) ) );
-    }
-    
-    str = argv[0]->ToString();
-    len = str->Utf8Length();
-    if( !len ){
+    else if( !d.len ){
         return scope.Close( Undefined() );
     }
-    
-    ucsdet_setText( cd->csd, *String::Utf8Value( str ), len, &status );
-    if( U_FAILURE( status ) ){
-        return scope.Close( Throw( Str2Err( u_errorName( status ) ) ) );
+    else if( U_FAILURE( cd->Detect( &d ) ) ){
+        return scope.Close( Throw( Str2Err( u_errorName( d.status ) ) ) );
     }
-    else if( !( match = ucsdet_detect( cd->csd, &status ) ) ){
-        return scope.Close( Undefined() );
+    else if( d.match )
+    {
+        const char *enc = ucsdet_getName( d.match, &d.status );
+        
+        if( U_FAILURE( d.status ) ){
+            return scope.Close( Throw( Str2Err( u_errorName( d.status ) ) ) );
+        }
+    
+        return scope.Close( String::New( enc ) );
     }
     
-    enc = ucsdet_getName( match, &status );
-    if( U_FAILURE( status ) ){
-        return scope.Close( Throw( Str2Err( u_errorName( status ) ) ) );
-    }
-    
-    return scope.Close( String::New( enc ) );
+    return scope.Close( Undefined() );
 }
 
 void CharsetDiscovery::Initialize( Handle<Object> target )
@@ -120,7 +149,7 @@ void CharsetDiscovery::Initialize( Handle<Object> target )
     t->InstanceTemplate()->SetInternalFieldCount(1);
     t->SetClassName( String::NewSymbol("charset_discovery") );
     
-    NODE_SET_PROTOTYPE_METHOD( t, "detect", Detect );
+    NODE_SET_PROTOTYPE_METHOD( t, "getName", GetName );
     
     target->Set( String::NewSymbol("charset_discovery"), t->GetFunction() );
 }
