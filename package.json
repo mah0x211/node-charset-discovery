@@ -1,0 +1,17 @@
+{
+    "name" : "charset-discovery",
+    "description": "character set detection with icu4c",
+    "author": {
+        "name": "Masatoshi Teruya",
+        "url": "https://twitter.com/mah0x211"
+    },
+    "version" : "0.0.1",
+    "main" : "./index.js",
+    "repository": {
+        "type" : "git",
+        "url": "https://github.com/mah0x211/node-charset-discovery.git" 
+    },
+    "bugs" : {
+        "url": "https://github.com/mah0x211/node-charset-discovery/issues" 
+    }
+}
