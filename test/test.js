@@ -10,5 +10,9 @@ console.log(
 );
 
 var cd = new charsetDiscovery();
-console.log( cd );
-console.log( cd.detect('abc') );
+
+console.log( cd.getName('abcあいうえお@efg') );
+var res = cd.getName('abc', function(){
+    console.log( 'callback', arguments );
+});
+console.log( res );

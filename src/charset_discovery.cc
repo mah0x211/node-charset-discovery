@@ -25,12 +25,38 @@ using namespace node;
 #define Str2Err(v)          Exception::Error(String::New(v))
 #define Str2TypeErr(v)      Exception::TypeError(String::New(v))
 
+#define TryCallback(cb,self,argc,args)({\
+    TryCatch try_catch; \
+    cb->Call( self, argc, args ); \
+    if (try_catch.HasCaught()){ \
+        FatalException( try_catch ); \
+    } \
+})
+
 typedef struct {
+    int argc;
     Local<String> str;
+    size_t len;
+    Local<Function> callback;
+} Args_t;
+
+enum TaskType_e {
+    T_NAME = 0
+};
+
+typedef struct {
+    uv_work_t req;
+    pthread_mutex_t *mutex;
+    pthread_cond_t *cond;
+    Persistent<Function> callback;
+    int task;
+    UCharsetDetector *csd;
+    const char *str;
     size_t len;
     UErrorCode status;
     const UCharsetMatch *match;
-} Detect_t;
+    void *data;
+} Baton_t;
 
 // interface
 class CharsetDiscovery : public ObjectWrap 
@@ -39,17 +65,23 @@ class CharsetDiscovery : public ObjectWrap
         CharsetDiscovery();
         ~CharsetDiscovery();
         static void Initialize( Handle<Object> target );
-    
+        
     private:
         UCharsetDetector *csd;
         
-        Handle<Value> Prepare( Detect_t *d, const Arguments& argv );
-        UErrorCode Detect( Detect_t *d );
+        Handle<Value> Prepare( Args_t *args, const Arguments& argv );
+        Handle<Value> Task( int task, Args_t *args );
         
         static Handle<Value> New( const Arguments& argv );
         static Handle<Value> GetName( const Arguments& argv );
+        static void Detect( Baton_t *baton );
+        static void TaskWork( uv_work_t* req );
+        static void TaskAfter( uv_work_t* req );
 };
 
+
+// implements
+// public
 CharsetDiscovery::CharsetDiscovery()
 {
     csd = NULL;
@@ -60,85 +92,6 @@ CharsetDiscovery::~CharsetDiscovery()
     if( csd ){
         ucsdet_close( csd );
     }
-}
-
-Handle<Value> CharsetDiscovery::New( const Arguments& argv )
-{
-    HandleScope scope;
-    Handle<Value> retval = Undefined();
-    UErrorCode status = U_ZERO_ERROR;
-    CharsetDiscovery *cd = new CharsetDiscovery();
-    
-    cd->csd = ucsdet_open( &status );
-    if( U_FAILURE( status ) ){
-        delete cd;
-        retval = Throw( Str2Err( u_errorName( status ) ) );
-    }
-    else {
-        cd->Wrap( argv.This() );
-        retval = argv.This();
-    }
-    
-    return scope.Close( retval );
-}
-
-Handle<Value> CharsetDiscovery::Prepare( Detect_t *d, const Arguments& argv )
-{
-    int argc = argv.Length();
-    
-    if( !argc ){
-        return Str2Err( "undefined arguments" );
-    }
-    else if( !argv[0]->IsString() ){
-        return Str2TypeErr( "invalid type of arguments" );
-    }
-    
-    d->str = argv[0]->ToString();
-    d->len = d->str->Utf8Length();
-    
-    return Undefined();
-}
-
-UErrorCode CharsetDiscovery::Detect( Detect_t *d )
-{
-    d->status = U_ZERO_ERROR;
-    ucsdet_setText( csd, *String::Utf8Value( d->str ), d->len, &d->status );
-    if( !U_FAILURE( d->status ) ){
-        d->match = ucsdet_detect( csd, &d->status );
-        d->status = U_ZERO_ERROR;
-    }
-    
-    return d->status;
-}
-
-Handle<Value> CharsetDiscovery::GetName( const Arguments& argv )
-{
-    HandleScope scope;
-    CharsetDiscovery *cd = ObjUnwrap( CharsetDiscovery, argv.This() );
-    Detect_t d;
-    Handle<Value> retval = cd->Prepare( &d, argv );
-    
-    if( !retval->IsUndefined() ){
-        return scope.Close( Throw( retval ) );
-    }
-    else if( !d.len ){
-        return scope.Close( Undefined() );
-    }
-    else if( U_FAILURE( cd->Detect( &d ) ) ){
-        return scope.Close( Throw( Str2Err( u_errorName( d.status ) ) ) );
-    }
-    else if( d.match )
-    {
-        const char *enc = ucsdet_getName( d.match, &d.status );
-        
-        if( U_FAILURE( d.status ) ){
-            return scope.Close( Throw( Str2Err( u_errorName( d.status ) ) ) );
-        }
-    
-        return scope.Close( String::New( enc ) );
-    }
-    
-    return scope.Close( Undefined() );
 }
 
 void CharsetDiscovery::Initialize( Handle<Object> target )
@@ -153,6 +106,202 @@ void CharsetDiscovery::Initialize( Handle<Object> target )
     
     target->Set( String::NewSymbol("charset_discovery"), t->GetFunction() );
 }
+
+// private
+Handle<Value> CharsetDiscovery::Prepare( Args_t *args, const Arguments& argv )
+{
+    args->argc = argv.Length();
+    
+    if( !args->argc ){
+        return Str2Err( "undefined arguments" );
+    }
+    else if( !argv[0]->IsString() ){
+        return Str2TypeErr( "invalid type of arguments" );
+    }
+    
+    args->str = argv[0]->ToString();
+    args->len = args->str->Utf8Length();
+    if( args->argc > 1 )
+    {
+        if( !argv[1]->IsFunction() ){
+            return Str2TypeErr( "invalid type of arguments" );
+        }
+        args->callback = Local<Function>::Cast( argv[1] );
+    }
+    
+    return Undefined();
+}
+
+Handle<Value> CharsetDiscovery::Task( int task, Args_t *args )
+{
+    Handle<Value> retval = Undefined();
+    
+    if( args->argc < 2 )
+    {
+        Baton_t baton;
+        baton.task = task;
+        baton.csd = csd;
+        baton.str = *String::Utf8Value( args->str );
+        baton.len = args->len;
+        
+        Detect( &baton );
+        
+        if( U_FAILURE( baton.status ) ){
+            retval = Throw( Str2Err( u_errorName( baton.status ) ) );
+        }
+        else if( baton.data )
+        {
+            switch( task ){
+                case T_NAME:
+                    retval = String::New( (char*)baton.data );
+                break;
+            }
+        }
+    }
+    else
+    {
+        char *str = (char*)malloc( args->len * sizeof(char) + 1 );
+        
+        if( str )
+        {
+            int rc;
+            Baton_t *baton = new Baton_t;
+            
+            memcpy( (void*)str, (void*)*String::Utf8Value( args->str ), args->len );
+            str[args->len] = 0;
+            
+            baton->req.data = baton;
+            baton->callback = Persistent<Function>::New( args->callback );
+            baton->task = task;
+            baton->csd = csd;
+            baton->str = (const char*)str;
+            baton->len = args->len;
+            
+            rc = uv_queue_work( uv_default_loop(),
+                                &baton->req,
+                                TaskWork,
+                                (uv_after_work_cb)TaskAfter );
+            assert( rc == 0 );
+        }
+        else {
+            retval = String::New( strerror( errno ) );
+        }
+    }
+    
+    return retval;
+}
+
+Handle<Value> CharsetDiscovery::New( const Arguments& argv )
+{
+    HandleScope scope;
+    Handle<Value> retval = Undefined();
+    CharsetDiscovery *cd = new CharsetDiscovery();
+    UErrorCode status = U_ZERO_ERROR;
+    
+    cd->csd = ucsdet_open( &status );
+    if( U_FAILURE( status ) ){
+        delete cd;
+        retval = Throw( Str2Err( u_errorName( status ) ) );
+    }
+    else {
+        cd->Wrap( argv.This() );
+        retval = argv.This();
+    }
+    
+    return scope.Close( retval );
+}
+
+Handle<Value> CharsetDiscovery::GetName( const Arguments& argv )
+{
+    HandleScope scope;
+    CharsetDiscovery *cd = ObjUnwrap( CharsetDiscovery, argv.This() );
+    Args_t args;
+    Handle<Value> retval = cd->Prepare( &args, argv );
+    
+    if( !retval->IsUndefined() ){
+        return scope.Close( Throw( retval ) );
+    }
+    else if( !args.len )
+    {
+        if( !args.callback->IsUndefined() ){
+            Local<Value> arg[] = {};
+            // Context::GetCurrent()->Global()
+            args.callback->Call( args.callback, 0, arg );
+        }
+    }
+    else {
+        retval = cd->Task( T_NAME, &args );
+    }
+    
+    return scope.Close( retval );
+}
+
+void CharsetDiscovery::Detect( Baton_t *baton )
+{
+    baton->status = U_ZERO_ERROR;
+    baton->data = NULL;
+    baton->match = NULL;
+    ucsdet_setText( baton->csd, baton->str, baton->len, &baton->status );
+    if( !U_FAILURE( baton->status ) )
+    {
+        baton->match = ucsdet_detect( baton->csd, &baton->status );
+        baton->status = U_ZERO_ERROR;
+        if( baton->match )
+        {
+            switch( baton->task ){
+                case T_NAME:
+                    baton->data = (void*)ucsdet_getName( baton->match, 
+                                                         &baton->status );
+                break;
+            }
+        }
+    }
+}
+
+void CharsetDiscovery::TaskWork( uv_work_t* req )
+{
+    Baton_t *baton = static_cast<Baton_t*>( req->data );
+    
+    Detect( baton );
+}
+
+void CharsetDiscovery::TaskAfter( uv_work_t* req )
+{
+    HandleScope scope;
+    Baton_t *baton = static_cast<Baton_t*>( req->data );
+    
+    free( (void*)baton->str );
+    if( U_FAILURE( baton->status ) )
+    {
+        Local<Value> argv[1] = {
+            Str2Err( u_errorName( baton->status ) )
+        };
+        
+        TryCallback( baton->callback, Context::GetCurrent()->Global(), 1, argv );
+    }
+    else if( baton->data )
+    {
+        switch( baton->task ){
+            case T_NAME:
+                Local<Value> argv[2] = {
+                    Local<Value>::New( Undefined() ),
+                    Local<Value>::New( String::New( (char*)baton->data ) )
+                };
+                TryCallback( baton->callback, Context::GetCurrent()->Global(), 
+                             2, argv );
+            break;
+        }
+    }
+    else {
+        Local<Value> argv[] = {};
+        TryCallback( baton->callback, Context::GetCurrent()->Global(), 0, argv );
+    }
+    
+    baton->callback.Dispose();
+    delete baton;
+}
+
+
 
 static void init( Handle<Object> target ){
     HandleScope scope;
