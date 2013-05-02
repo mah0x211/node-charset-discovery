@@ -11,8 +11,8 @@ console.log(
 
 var cd = new charsetDiscovery();
 
-console.log( cd.getName('abcあいうえお@efg') );
-var res = cd.getName('abc', function(){
+console.log( cd.getName( new Buffer('abcあいうえお@efg','binary') ) );
+var res = cd.getName(new Buffer('abc','binary'), function(){
     console.log( 'callback', arguments );
 });
 console.log( res );

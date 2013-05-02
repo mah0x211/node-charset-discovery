@@ -18,9 +18,6 @@ using namespace node;
 
 
 #define ObjUnwrap(tmpl,obj) ObjectWrap::Unwrap<tmpl>(obj)
-#define Arg2Str(v)          *(String::Utf8Value( (v)->ToString()))
-#define Arg2Int(v)          ((v)->IntegerValue())
-#define Arg2Uint32(v)       ((v)->Uint32Value())
 #define Throw(v)            ThrowException(v)
 #define Str2Err(v)          Exception::Error(String::New(v))
 #define Str2TypeErr(v)      Exception::TypeError(String::New(v))
@@ -35,7 +32,7 @@ using namespace node;
 
 typedef struct {
     int argc;
-    Local<String> str;
+    const char *str;
     size_t len;
     Local<Function> callback;
 } Args_t;
@@ -115,12 +112,13 @@ Handle<Value> CharsetDiscovery::Prepare( Args_t *args, const Arguments& argv )
     if( !args->argc ){
         return Str2Err( "undefined arguments" );
     }
-    else if( !argv[0]->IsString() ){
+    else if( !Buffer::HasInstance( argv[0] ) ){
         return Str2TypeErr( "invalid type of arguments" );
     }
     
-    args->str = argv[0]->ToString();
-    args->len = args->str->Utf8Length();
+    args->str = Buffer::Data( argv[0] );
+    args->len = Buffer::Length( argv[0] );
+    
     if( args->argc > 1 )
     {
         if( !argv[1]->IsFunction() ){
@@ -153,7 +151,7 @@ Handle<Value> CharsetDiscovery::Task( int task, const Arguments& argv )
         Baton_t baton;
         baton.task = task;
         baton.csd = csd;
-        baton.str = *String::Utf8Value( args.str );
+        baton.str = args.str;
         baton.len = args.len;
         
         Detect( &baton );
@@ -179,7 +177,7 @@ Handle<Value> CharsetDiscovery::Task( int task, const Arguments& argv )
             int rc;
             Baton_t *baton = new Baton_t;
             
-            memcpy( (void*)str, (void*)*String::Utf8Value( args.str ), args.len );
+            memcpy( (void*)str, args.str, args.len );
             str[args.len] = 0;
             
             baton->req.data = baton;
