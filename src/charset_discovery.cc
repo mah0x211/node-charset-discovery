@@ -41,7 +41,7 @@ typedef struct {
 } Args_t;
 
 enum TaskType_e {
-    T_NAME = 0
+    T_NAME = 1 << 0,
 };
 
 typedef struct {
@@ -70,7 +70,7 @@ class CharsetDiscovery : public ObjectWrap
         UCharsetDetector *csd;
         
         Handle<Value> Prepare( Args_t *args, const Arguments& argv );
-        Handle<Value> Task( int task, Args_t *args );
+        Handle<Value> Task( int task, const Arguments& argv );
         
         static Handle<Value> New( const Arguments& argv );
         static Handle<Value> GetName( const Arguments& argv );
@@ -132,17 +132,29 @@ Handle<Value> CharsetDiscovery::Prepare( Args_t *args, const Arguments& argv )
     return Undefined();
 }
 
-Handle<Value> CharsetDiscovery::Task( int task, Args_t *args )
+Handle<Value> CharsetDiscovery::Task( int task, const Arguments& argv )
 {
-    Handle<Value> retval = Undefined();
+    Args_t args;
+    Handle<Value> retval = Prepare( &args, argv );
     
-    if( args->argc < 2 )
+    if( !retval->IsUndefined() ){
+        return Throw( retval );
+    }
+    else if( !args.len )
+    {
+        if( !args.callback->IsUndefined() ){
+            Local<Value> arg[] = {};
+            // Context::GetCurrent()->Global()
+            args.callback->Call( args.callback, 0, arg );
+        }
+    }
+    else if( args.argc < 2 )
     {
         Baton_t baton;
         baton.task = task;
         baton.csd = csd;
-        baton.str = *String::Utf8Value( args->str );
-        baton.len = args->len;
+        baton.str = *String::Utf8Value( args.str );
+        baton.len = args.len;
         
         Detect( &baton );
         
@@ -160,22 +172,22 @@ Handle<Value> CharsetDiscovery::Task( int task, Args_t *args )
     }
     else
     {
-        char *str = (char*)malloc( args->len * sizeof(char) + 1 );
+        char *str = (char*)malloc( args.len * sizeof(char) + 1 );
         
         if( str )
         {
             int rc;
             Baton_t *baton = new Baton_t;
             
-            memcpy( (void*)str, (void*)*String::Utf8Value( args->str ), args->len );
-            str[args->len] = 0;
+            memcpy( (void*)str, (void*)*String::Utf8Value( args.str ), args.len );
+            str[args.len] = 0;
             
             baton->req.data = baton;
-            baton->callback = Persistent<Function>::New( args->callback );
+            baton->callback = Persistent<Function>::New( args.callback );
             baton->task = task;
             baton->csd = csd;
             baton->str = (const char*)str;
-            baton->len = args->len;
+            baton->len = args.len;
             
             rc = uv_queue_work( uv_default_loop(),
                                 &baton->req,
@@ -215,25 +227,8 @@ Handle<Value> CharsetDiscovery::GetName( const Arguments& argv )
 {
     HandleScope scope;
     CharsetDiscovery *cd = ObjUnwrap( CharsetDiscovery, argv.This() );
-    Args_t args;
-    Handle<Value> retval = cd->Prepare( &args, argv );
     
-    if( !retval->IsUndefined() ){
-        return scope.Close( Throw( retval ) );
-    }
-    else if( !args.len )
-    {
-        if( !args.callback->IsUndefined() ){
-            Local<Value> arg[] = {};
-            // Context::GetCurrent()->Global()
-            args.callback->Call( args.callback, 0, arg );
-        }
-    }
-    else {
-        retval = cd->Task( T_NAME, &args );
-    }
-    
-    return scope.Close( retval );
+    return scope.Close( cd->Task( T_NAME, argv ) );
 }
 
 void CharsetDiscovery::Detect( Baton_t *baton )
@@ -248,11 +243,9 @@ void CharsetDiscovery::Detect( Baton_t *baton )
         baton->status = U_ZERO_ERROR;
         if( baton->match )
         {
-            switch( baton->task ){
-                case T_NAME:
-                    baton->data = (void*)ucsdet_getName( baton->match, 
-                                                         &baton->status );
-                break;
+            if( baton->task & T_NAME ){
+                baton->data = (void*)ucsdet_getName( baton->match, 
+                                                     &baton->status );
             }
         }
     }
